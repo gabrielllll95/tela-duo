@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tela Duo — Compartilhe sua tela</title>
+  <style>
+    :root { color-scheme: dark; --bg:#101116; --panel:#191b24; --line:#2b2e3b; --accent:#7c5cff; --muted:#a8abba; }
+    * { box-sizing:border-box }
+    body { margin:0; min-height:100vh; background:radial-gradient(ellipse at top,#202038 0,#101116 55%); color:#f5f5fa; font:16px system-ui,-apple-system,Segoe UI,sans-serif; display:flex; justify-content:center; padding:28px 16px; }
+    main { width:min(980px,100%); }
+    header { text-align:center; margin:14px 0 26px; }
+    .logo { display:inline-grid; place-items:center; width:48px;height:48px;border-radius:15px;background:var(--accent);font-size:24px;margin-bottom:8px }
+    h1 { margin:0;font-size:clamp(26px,4vw,38px);letter-spacing:-1px }
+    header p { color:var(--muted);margin:8px 0 }
+    .panel { background:rgba(25,27,36,.94); border:1px solid var(--line); border-radius:18px; padding:20px; box-shadow:0 20px 60px #0003; }
+    .join { display:flex; gap:10px; flex-wrap:wrap; }
+    input { flex:1; min-width:180px; background:#101116; color:white; border:1px solid var(--line); border-radius:10px;padding:13px 14px;font:inherit; }
+    button { border:0;border-radius:10px;padding:12px 16px;font:600 15px system-ui;cursor:pointer;background:var(--accent);color:white; }
+    button.secondary { background:#2b2e3b } button:disabled { opacity:.45;cursor:not-allowed }
+    .status { color:var(--muted);font-size:14px;margin:13px 0 0;min-height:20px }
+    .videos { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:18px; }
+    .video-box { min-width:0;background:#0b0c10;border:1px solid var(--line);border-radius:14px;overflow:hidden; }
+    .video-box video { display:block;width:100%;aspect-ratio:16/9;object-fit:contain;background:#08090c; }
+    .video-label { padding:10px 12px;font-size:13px;color:var(--muted);display:flex;justify-content:space-between;gap:8px }
+    .actions { display:flex;gap:10px;flex-wrap:wrap;margin-top:14px }
+    .hint { color:var(--muted);font-size:13px;line-height:1.5;margin:18px 2px 0 }
+    @media(max-width:640px){.videos{grid-template-columns:1fr}.panel{padding:14px}}
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="logo">▣</div>
+    <h1>Tela Duo</h1>
+    <p>Compartilhamento de tela simples, só para duas pessoas.</p>
+  </header>
+  <section class="panel">
+    <div class="join">
+      <input id="room" maxlength="40" placeholder="Código da sala (ex.: sala123)" autocomplete="off">
+      <button id="joinBtn">Entrar na sala</button>
+    </div>
+    <div class="status" id="status" role="status">Crie um código e envie-o para a outra pessoa.</div>
+    <div class="videos">
+      <div class="video-box">
+        <video id="remoteVideo" autoplay playsinline></video>
+        <div class="video-label"><span>Tela da outra pessoa</span><span id="remoteState">Aguardando</span></div>
+      </div>
+      <div class="video-box">
+        <video id="localVideo" autoplay muted playsinline></video>
+        <div class="video-label"><span>Sua tela</span><span id="localState">Não compartilhando</span></div>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="shareBtn" disabled>Compartilhar tela inteira</button>
+      <button id="stopBtn" class="secondary" disabled>Parar compartilhamento</button>
+      <button id="leaveBtn" class="secondary" disabled>Sair da sala</button>
+    </div>
+    <p class="hint">Dica: os dois participantes precisam usar o mesmo código. Clique em “Compartilhar tela inteira” e escolha “Tela inteira” no aviso do navegador. O navegador exige HTTPS quando o site estiver publicado (localhost funciona sem HTTPS). Compartilhe o código apenas com quem você quer que entre.</p>
+  </section>
+</main>
+<script src="/socket.io/socket.io.js"></script>
+<script>
+(() => {
+  const socket = io();
+  const $ = id => document.getElementById(id);
+  const roomInput = $("room"), joinBtn = $("joinBtn"), shareBtn = $("shareBtn");
+  const stopBtn = $("stopBtn"), leaveBtn = $("leaveBtn"), status = $("status");
+  const localVideo = $("localVideo"), remoteVideo = $("remoteVideo");
+  const remoteState = $("remoteState"), localState = $("localState");
+  let roomId = null, pc = null, localStream = null, joined = false, makingOffer = false;
+  let polite = false, ignoreOffer = false, settingRemoteAnswer = false;
+  const config = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+  function say(text) { status.textContent = text; }
+  function makePeer() {
+    if (pc) pc.close();
+    pc = new RTCPeerConnection(config);
+    pc.onicecandidate = e => { if (e.candidate && roomId) socket.emit("signal", { roomId, data: { candidate: e.candidate } }); };
+    pc.ontrack = e => {
+      if (remoteVideo.srcObject !== e.streams[0]) remoteVideo.srcObject = e.streams[0];
+      remoteState.textContent = "Conectado";
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc && ["failed", "disconnected", "closed"].includes(pc.connectionState)) remoteState.textContent = "Desconectado";
+      if (pc && pc.connectionState === "connected") remoteState.textContent = "Conectado";
+    };
+    pc.onnegotiationneeded = async () => {
+      try {
+        makingOffer = true;
+        await pc.setLocalDescription();
+        socket.emit("signal", { roomId, data: { description: pc.localDescription } });
+      } catch (err) { console.error(err); }
+      finally { makingOffer = false; }
+    };
+  }
+
+  async function handleSignal(data) {
+    if (!pc) makePeer();
+    try {
+      if (data.description) {
+        const description = data.description;
+        const readyForOffer = !makingOffer && (pc.signalingState === "stable" || settingRemoteAnswer);
+        const offerCollision = description.type === "offer" && !readyForOffer;
+        ignoreOffer = !polite && offerCollision;
+        if (ignoreOffer) return;
+        settingRemoteAnswer = description.type === "answer";
+        await pc.setRemoteDescription(description);
+        settingRemoteAnswer = false;
+        if (description.type === "offer") {
+          await pc.setLocalDescription();
+          socket.emit("signal", { roomId, data: { description: pc.localDescription } });
+        }
+      } else if (data.candidate) {
+        try { await pc.addIceCandidate(data.candidate); } catch (err) { if (!ignoreOffer) throw err; }
+      }
+    } catch (err) { console.error("Falha na conexão WebRTC:", err); }
+  }
+
+  joinBtn.onclick = () => {
+    const wanted = roomInput.value.trim();
+    if (!wanted) return say("Digite um código para a sala.");
+    joinBtn.disabled = true;
+    socket.emit("join-room", { roomId: wanted }, result => {
+      joinBtn.disabled = false;
+      if (!result || !result.ok) return say(result?.error || "Não foi possível entrar.");
+      roomId = result.roomId; joined = true; polite = !result.isInitiator;
+      makePeer();
+      roomInput.disabled = true; shareBtn.disabled = false; leaveBtn.disabled = false;
+      say("Você entrou na sala. Envie o código para a outra pessoa.");
+    });
+  };
+
+  socket.on("peer-joined", () => say("A outra pessoa entrou. Agora você pode compartilhar sua tela."));
+  socket.on("peer-left", () => {
+    remoteVideo.srcObject = null; remoteState.textContent = "Aguardando";
+    if (pc) { pc.close(); pc = null; }
+    if (joined) { makePeer(); say("A outra pessoa saiu. A sala continua aberta para uma nova conexão."); }
+  });
+  socket.on("signal", handleSignal);
+
+  shareBtn.onclick = async () => {
+    try {
+      localStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true });
+      localVideo.srcObject = localStream;
+      localState.textContent = "Compartilhando";
+      shareBtn.disabled = true; stopBtn.disabled = false;
+      if (!pc) makePeer();
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      const videoTrack = localStream.getVideoTracks()[0];
+      if (videoTrack) videoTrack.onended = stopSharing;
+      say("Sua tela está sendo compartilhada.");
+    } catch (err) {
+      if (err.name !== "NotAllowedError") say("Não foi possível compartilhar a tela. Verifique as permissões do navegador.");
+    }
+  };
+
+  function stopSharing() {
+    if (localStream) {
+      localStream.getTracks().forEach(track => track.stop());
+      localStream = null;
+    }
+    localVideo.srcObject = null; localState.textContent = "Não compartilhando";
+    if (pc) pc.getSenders().forEach(sender => {
+      if (sender.track && sender.track.kind === "video") pc.removeTrack(sender);
+      else if (sender.track && sender.track.kind === "audio") pc.removeTrack(sender);
+    });
+    shareBtn.disabled = !joined; stopBtn.disabled = true;
+  }
+  stopBtn.onclick = stopSharing;
+
+  leaveBtn.onclick = () => {
+    if (localStream) stopSharing();
+    socket.emit("leave-room");
+    if (pc) { pc.close(); pc = null; }
+    roomId = null; joined = false; polite = false;
+    remoteVideo.srcObject = null; remoteState.textContent = "Aguardando";
+    roomInput.disabled = false; joinBtn.disabled = false;
+    shareBtn.disabled = true; stopBtn.disabled = true; leaveBtn.disabled = true;
+    say("Você saiu da sala.");
+  };
+})();
+</script>
+</body>
+</html>
